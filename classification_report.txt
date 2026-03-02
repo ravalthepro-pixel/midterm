@@ -1,0 +1,27 @@
+============================================================
+ASL CNN — Per-Class Classification Report
+Authors: Jasraj "Jay" Raval & Jack Sweeney
+AI 100 — Deep Learning Midterm Project
+============================================================
+
+NOTE: This is a placeholder. Run `python train.py` to generate
+real results from your training run.
+
+Expected output format:
+
+              precision    recall  f1-score   support
+
+           0     0.9500    0.9550    0.9525        40
+           1     0.9600    0.9400    0.9499        42
+           2     0.9300    0.9450    0.9374        40
+           3     0.9400    0.9500    0.9449        41
+           4     0.9550    0.9300    0.9423        43
+           5     0.9450    0.9600    0.9524        40
+           6     0.9600    0.9650    0.9625        41
+           7     0.9350    0.9400    0.9375        42
+           8     0.9500    0.9450    0.9475        40
+           9     0.9650    0.9500    0.9574        43
+
+    accuracy                         0.9480       412
+   macro avg     0.9490    0.9480    0.9484       412
+weighted avg     0.9491    0.9480    0.9484       412
