@@ -1,0 +1,33 @@
+# ============================================================
+# ASL Hand Sign Digit Classification — Python Dependencies
+# ============================================================
+# Course  : AI 100 — Deep Learning Midterm Project
+# Authors : Jasraj "Jay" Raval & Jack Sweeney
+# Date    : March 1, 2026
+#
+# Install all dependencies:
+#   pip install -r requirements.txt
+#
+# For GPU support (CUDA 11.8), install PyTorch separately:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+# Visit https://pytorch.org/get-started/locally/ for the right
+# command for your OS + CUDA version.
+# ============================================================
+
+# ── Deep Learning Framework ──────────────────────────────────
+torch>=2.0.0           # Core deep learning framework
+torchvision>=0.15.0    # Datasets (ImageFolder), transforms, pretrained models
+
+# ── Scientific Computing ─────────────────────────────────────
+numpy>=1.24.0          # Array operations, index manipulation
+
+# ── Machine Learning Utilities ───────────────────────────────
+scikit-learn>=1.2.0    # confusion_matrix, classification_report, metrics
+
+# ── Visualization ─────────────────────────────────────────────
+matplotlib>=3.7.0      # Training curves, sample prediction plots
+seaborn>=0.12.0        # Confusion matrix heatmap
+
+# ── Image Processing ──────────────────────────────────────────
+Pillow>=9.5.0          # Image loading (PIL.Image), used by torchvision

@@ -1,313 +1,415 @@
 """
-ASL Hand Sign Digit Classification (0-9)
-Deep Learning Midterm Project
-AI 100 - Group Project
+================================================================================
+ASL Hand Sign Digit Classification — Training Script
+================================================================================
+Course  : AI 100 — Deep Learning Midterm Project
+Authors : Jasraj "Jay" Raval & Jack Sweeney
+Date    : March 1, 2026
+GitHub  : https://github.com/N4w4fn4ss4r/Midterm-project
+--------------------------------------------------------------------------------
 
-Dataset: ASL Digit Dataset
-  Download from: https://www.kaggle.com/datasets/rayeed045/american-sign-language-digit-dataset
-  After downloading, extract so your folder structure looks like:
-    asl_digits/
-      0/  (images of sign for digit 0)
-      1/
-      ...
-      9/
+What this script does
+---------------------
+1. Loads the ASL Digit Dataset using torchvision.datasets.ImageFolder.
+2. Splits into 80% training / 20% validation (fixed seed for reproducibility).
+3. Applies separate transforms: augmentation for train, resize+normalize for val.
+4. Instantiates the ASL_CNN model and prints trainable parameter count.
+5. Trains for 20 epochs with Adam optimizer and StepLR scheduler.
+6. Saves the best model checkpoint (by validation accuracy) to best_model.pth.
+7. After training, loads the best checkpoint and runs final evaluation.
+8. Generates and saves:
+    - training_curves.png     (loss + accuracy curves)
+    - confusion_matrix.png    (10×10 heatmap)
+    - sample_predictions.png  (10 sample val images with true/pred labels)
+    - classification_report.txt (per-class precision/recall/F1)
 
-Usage:
-  python train.py
+Dataset Folder Structure Required
+----------------------------------
+    data/
+    ├── 0/   *.jpg / *.png
+    ├── 1/   *.jpg / *.png
+    ...
+    └── 9/   *.jpg / *.png
 
-Requirements:
-  pip install torch torchvision matplotlib scikit-learn seaborn Pillow
+Download from:
+    https://www.kaggle.com/datasets/rayeed045/american-sign-language-digit-dataset
+
+Run
+---
+    python train.py
+
+Requirements
+------------
+    pip install -r requirements.txt
+================================================================================
 """
 
+# ── Standard Library ──────────────────────────────────────────────────────────
 import os
 import time
+import random
+
+# ── Third Party ───────────────────────────────────────────────────────────────
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.optim.lr_scheduler import StepLR
 from torchvision import datasets, transforms
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')  # non-interactive backend for VS Code
-from sklearn.metrics import confusion_matrix, classification_report
-import seaborn as sns
-import numpy as np
+from torch.utils.data import DataLoader, Subset
 
-# ─────────────────────────────────────────────
-# 1. CONFIG
-# ─────────────────────────────────────────────
-DATA_DIR    = "asl_digits"   # folder with subfolders 0-9
-BATCH_SIZE  = 32
-NUM_EPOCHS  = 20
-LR          = 0.001
-IMG_SIZE    = 64
-DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CLASS_NAMES = [str(i) for i in range(10)]
+# ── Local Modules ─────────────────────────────────────────────────────────────
+from model import ASL_CNN
+from utils import (
+    plot_training_curves,
+    plot_confusion_matrix,
+    plot_sample_predictions,
+    save_classification_report,
+    check_dataset_structure,
+)
 
-print(f"Using device: {DEVICE}")
 
-# ─────────────────────────────────────────────
-# 2. DATA LOADING & AUGMENTATION
-# ─────────────────────────────────────────────
-train_transforms = transforms.Compose([
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+DATA_DIR      = "data"           # Root folder with one subfolder per class
+IMG_SIZE      = 64               # Resize all images to IMG_SIZE × IMG_SIZE
+BATCH_SIZE    = 32               # Number of images per mini-batch
+EPOCHS        = 20               # Total training epochs
+LR            = 0.001            # Initial learning rate for Adam
+LR_STEP_SIZE  = 7                # Decay LR every N epochs
+LR_GAMMA      = 0.5              # Multiply LR by this factor at each step
+VAL_SPLIT     = 0.2              # Fraction of data reserved for validation
+SEED          = 42               # Random seed for reproducibility
+CHECKPOINT    = "best_model.pth" # Filename to save best model weights
+NUM_WORKERS   = 2                # DataLoader worker processes (0 on Windows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REPRODUCIBILITY
+# Set all random seeds so the train/val split and weight initialization are
+# the same every time the script is run, enabling fair comparison across runs.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Make cuDNN deterministic (slightly slower, but reproducible)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(SEED)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEVICE DETECTION
+# Use GPU (CUDA) if available, otherwise fall back to CPU.
+# Training on CPU takes 5–15 minutes; GPU takes ~1–2 minutes.
+# ══════════════════════════════════════════════════════════════════════════════
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("=" * 60)
+print(f"  ASL CNN Training — Jasraj Raval & Jack Sweeney")
+print("=" * 60)
+print(f"  Device     : {device}")
+if torch.cuda.is_available():
+    print(f"  GPU        : {torch.cuda.get_device_name(0)}")
+    print(f"  CUDA ver   : {torch.version.cuda}")
+print(f"  PyTorch    : {torch.__version__}")
+print("=" * 60)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATASET VALIDATION
+# Verify the expected folder structure before attempting to load data.
+# This prevents cryptic errors from a mis-organized dataset.
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("\n[1/6] Validating dataset structure...")
+if not check_dataset_structure(DATA_DIR, expected_classes=10):
+    raise RuntimeError(
+        f"\nDataset validation failed. Please ensure '{DATA_DIR}/' contains "
+        "10 subdirectories named '0' through '9', each containing image files.\n"
+        "Download from: https://www.kaggle.com/datasets/rayeed045/"
+        "american-sign-language-digit-dataset"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA TRANSFORMS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Training transforms include augmentation to improve generalization.
+# Augmentation creates slightly different versions of each image on each epoch,
+# effectively increasing the dataset size and preventing overfitting.
+train_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(10),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+
+    # Augmentation: random horizontal flip (p=0.5)
+    # Many ASL digit signs are meaningful when mirrored, so flipping is safe.
+    transforms.RandomHorizontalFlip(p=0.5),
+
+    # Augmentation: random rotation up to ±10 degrees
+    # Accounts for variation in hand tilt across different images/photographers.
+    transforms.RandomRotation(degrees=10),
+
+    # Augmentation: random color jitter
+    # Accounts for variation in lighting, camera white balance, and exposure.
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+
+    # Convert PIL Image → PyTorch Tensor with shape [3, H, W], values in [0, 1]
     transforms.ToTensor(),
-    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+
+    # Normalize per-channel to [-1, 1] using mean=0.5, std=0.5.
+    # This centers the input distribution around zero, which helps gradient
+    # descent converge faster and more stably.
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
 ])
 
-val_transforms = transforms.Compose([
+# Validation transforms: NO augmentation.
+# We evaluate on clean, unmodified images to get an unbiased accuracy estimate.
+val_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
-    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
 ])
 
-# Load full dataset then split 80/20
-full_dataset = datasets.ImageFolder(root=DATA_DIR, transform=train_transforms)
-n_total  = len(full_dataset)
-n_train  = int(0.8 * n_total)
-n_val    = n_total - n_train
-train_set, val_set = random_split(full_dataset, [n_train, n_val])
 
-# Apply val transforms to validation split
-val_set.dataset = datasets.ImageFolder(root=DATA_DIR, transform=val_transforms)
+# ══════════════════════════════════════════════════════════════════════════════
+# DATASET LOADING AND SPLITTING
+# ══════════════════════════════════════════════════════════════════════════════
 
-train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
-val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+print("\n[2/6] Loading and splitting dataset...")
 
-print(f"Dataset: {n_total} images | Train: {n_train} | Val: {n_val}")
+# Load full dataset once to get total size and generate the index split.
+# We do NOT use this instance directly for training — we create two separate
+# instances (with different transforms) and use index subsets.
+_full = datasets.ImageFolder(root=DATA_DIR)
+n_total = len(_full)
+n_val   = int(n_total * VAL_SPLIT)
+n_train = n_total - n_val
 
-# ─────────────────────────────────────────────
-# 3. CNN MODEL DEFINITION
-# ─────────────────────────────────────────────
-class ASL_CNN(nn.Module):
-    """
-    A simple 3-block CNN for 10-class classification.
-    
-    Architecture:
-      Block 1: Conv(3→32) -> BN -> ReLU -> MaxPool
-      Block 2: Conv(32→64) -> BN -> ReLU -> MaxPool
-      Block 3: Conv(64→128) -> BN -> ReLU -> MaxPool
-      Classifier: Flatten -> FC(2048->256) -> Dropout -> FC(256->10)
-    """
-    def __init__(self, num_classes=10):
-        super(ASL_CNN, self).__init__()
+# Generate a reproducible random permutation of all indices, then split.
+all_indices = list(range(n_total))
+rng = np.random.default_rng(seed=SEED)
+rng.shuffle(all_indices)
+train_indices = all_indices[:n_train]
+val_indices   = all_indices[n_train:]
 
-        self.features = nn.Sequential(
-            # Block 1
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),          # 64 -> 32
+# Create two ImageFolder instances — one per transform — and apply index subsets.
+train_dataset = Subset(
+    datasets.ImageFolder(root=DATA_DIR, transform=train_transform),
+    train_indices
+)
+val_dataset = Subset(
+    datasets.ImageFolder(root=DATA_DIR, transform=val_transform),
+    val_indices
+)
 
-            # Block 2
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),          # 32 -> 16
+# DataLoaders handle batching, shuffling, and parallel data loading.
+# shuffle=True for training ensures different batch compositions each epoch.
+# shuffle=False for validation (order doesn't matter; we want deterministic eval).
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=NUM_WORKERS,
+    pin_memory=True if torch.cuda.is_available() else False,
+)
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    pin_memory=True if torch.cuda.is_available() else False,
+)
 
-            # Block 3
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),          # 16 -> 8
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 8 * 8, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_classes)
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
+classes = _full.classes   # e.g., ['0', '1', ..., '9']
+print(f"  Classes    : {classes}")
+print(f"  Total imgs : {n_total}")
+print(f"  Train      : {n_train} ({100*(1-VAL_SPLIT):.0f}%)")
+print(f"  Validation : {n_val} ({100*VAL_SPLIT:.0f}%)")
+print(f"  Batch size : {BATCH_SIZE}")
+print(f"  Train iters: {len(train_loader)} batches/epoch")
 
 
-model = ASL_CNN(num_classes=10).to(DEVICE)
-print(f"\nModel architecture:\n{model}")
-total_params = sum(p.numel() for p in model.parameters())
-print(f"\nTotal parameters: {total_params:,}")
+# ══════════════════════════════════════════════════════════════════════════════
+# MODEL, LOSS, OPTIMIZER, SCHEDULER
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────────
-# 4. TRAINING SETUP
-# ─────────────────────────────────────────────
+print("\n[3/6] Building model...")
+
+model = ASL_CNN(num_classes=len(classes)).to(device)
+n_params = model.count_parameters()
+print(f"  Architecture: ASL_CNN (custom 3-block CNN)")
+print(f"  Parameters  : {n_params:,}")
+
+# CrossEntropyLoss combines LogSoftmax + NLLLoss.
+# It expects raw logits (not softmax output) and class indices as targets.
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=LR)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.5)
 
-# ─────────────────────────────────────────────
-# 5. TRAINING LOOP
-# ─────────────────────────────────────────────
+# Adam optimizer: adaptive per-parameter learning rates + momentum.
+# Generally converges faster than SGD for image classification.
+optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+
+# StepLR: multiply LR by gamma every step_size epochs.
+# Allows aggressive early updates and fine-grained tuning near convergence.
+scheduler = StepLR(optimizer, step_size=LR_STEP_SIZE, gamma=LR_GAMMA)
+
+print(f"  Optimizer   : Adam (lr={LR}, weight_decay=1e-4)")
+print(f"  Scheduler   : StepLR (step={LR_STEP_SIZE}, gamma={LR_GAMMA})")
+print(f"  Loss        : CrossEntropyLoss")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRAINING LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+print(f"\n[4/6] Training for {EPOCHS} epochs...")
+print("-" * 70)
+print(f"{'Epoch':>6} | {'Train Loss':>10} | {'Train Acc':>9} | "
+      f"{'Val Loss':>8} | {'Val Acc':>7} | {'LR':>8}")
+print("-" * 70)
+
+# Track metrics for plotting
 train_losses, val_losses = [], []
 train_accs,   val_accs   = [], []
+best_val_acc  = 0.0
+best_epoch    = 0
+start_time    = time.time()
 
-print("\n" + "="*60)
-print("Starting Training...")
-print("="*60)
+for epoch in range(1, EPOCHS + 1):
 
-best_val_acc = 0.0
-start_time = time.time()
+    # ── Training Phase ────────────────────────────────────────────────────────
+    model.train()   # Enables Dropout and BatchNorm in training mode
+    running_loss = 0.0
+    correct      = 0
+    total        = 0
 
-for epoch in range(NUM_EPOCHS):
-    # ── Train ──
-    model.train()
-    running_loss, correct, total = 0.0, 0, 0
-    for images, labels in train_loader:
-        images, labels = images.to(DEVICE), labels.to(DEVICE)
+    for batch_imgs, batch_labels in train_loader:
+        batch_imgs   = batch_imgs.to(device, non_blocking=True)
+        batch_labels = batch_labels.to(device, non_blocking=True)
+
+        # Zero gradients from the previous step.
+        # Gradients accumulate by default in PyTorch; must be cleared each step.
         optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+
+        # Forward pass: compute predicted logits
+        logits = model(batch_imgs)
+
+        # Compute loss between predictions and ground truth labels
+        loss = criterion(logits, batch_labels)
+
+        # Backward pass: compute gradients via backpropagation
         loss.backward()
+
+        # Gradient clipping: prevents exploding gradients (optional but safe)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # Update model weights using computed gradients
         optimizer.step()
 
-        running_loss += loss.item() * images.size(0)
-        _, predicted = outputs.max(1)
-        correct += predicted.eq(labels).sum().item()
-        total   += labels.size(0)
+        # Accumulate metrics
+        running_loss += loss.item() * batch_imgs.size(0)
+        preds         = logits.argmax(dim=1)
+        correct      += (preds == batch_labels).sum().item()
+        total        += batch_labels.size(0)
 
     train_loss = running_loss / total
-    train_acc  = 100.0 * correct / total
+    train_acc  = correct / total
 
-    # ── Validate ──
-    model.eval()
-    running_loss, correct, total = 0.0, 0, 0
-    with torch.no_grad():
-        for images, labels in val_loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+    # ── Validation Phase ──────────────────────────────────────────────────────
+    model.eval()    # Disables Dropout; uses running stats for BatchNorm
+    running_loss = 0.0
+    correct      = 0
+    total        = 0
 
-            running_loss += loss.item() * images.size(0)
-            _, predicted = outputs.max(1)
-            correct += predicted.eq(labels).sum().item()
-            total   += labels.size(0)
+    with torch.no_grad():   # Disable gradient computation for efficiency
+        for batch_imgs, batch_labels in val_loader:
+            batch_imgs   = batch_imgs.to(device, non_blocking=True)
+            batch_labels = batch_labels.to(device, non_blocking=True)
+
+            logits = model(batch_imgs)
+            loss   = criterion(logits, batch_labels)
+
+            running_loss += loss.item() * batch_imgs.size(0)
+            preds         = logits.argmax(dim=1)
+            correct      += (preds == batch_labels).sum().item()
+            total        += batch_labels.size(0)
 
     val_loss = running_loss / total
-    val_acc  = 100.0 * correct / total
+    val_acc  = correct / total
 
+    # Step the LR scheduler after each epoch
     scheduler.step()
+    current_lr = scheduler.get_last_lr()[0]
 
-    train_losses.append(train_loss);  val_losses.append(val_loss)
-    train_accs.append(train_acc);     val_accs.append(val_acc)
+    # Record metrics
+    train_losses.append(train_loss); val_losses.append(val_loss)
+    train_accs.append(train_acc);    val_accs.append(val_acc)
 
+    # Save best checkpoint
     if val_acc > best_val_acc:
         best_val_acc = val_acc
-        torch.save(model.state_dict(), "best_model.pth")
+        best_epoch   = epoch
+        torch.save(model.state_dict(), CHECKPOINT)
+        checkpoint_marker = " ← best"
+    else:
+        checkpoint_marker = ""
 
-    print(f"Epoch [{epoch+1:02d}/{NUM_EPOCHS}] "
-          f"Train Loss: {train_loss:.4f}  Train Acc: {train_acc:.1f}%  |  "
-          f"Val Loss: {val_loss:.4f}  Val Acc: {val_acc:.1f}%")
+    print(f"{epoch:>6} | {train_loss:>10.4f} | {train_acc:>9.4f} | "
+          f"{val_loss:>8.4f} | {val_acc:>7.4f} | {current_lr:>8.6f}"
+          f"{checkpoint_marker}")
 
 elapsed = time.time() - start_time
-print(f"\nTraining complete in {elapsed:.0f}s  |  Best Val Acc: {best_val_acc:.1f}%")
+print("-" * 70)
+print(f"\nTraining complete in {elapsed:.1f}s ({elapsed/60:.1f} min)")
+print(f"Best validation accuracy: {best_val_acc:.4f} (epoch {best_epoch})")
+print(f"Best checkpoint saved to: {CHECKPOINT}")
 
-# ─────────────────────────────────────────────
-# 6. PLOT: LOSS & ACCURACY CURVES
-# ─────────────────────────────────────────────
-epochs_range = range(1, NUM_EPOCHS + 1)
 
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-fig.suptitle("ASL Digit CNN — Training Results", fontsize=14, fontweight='bold')
+# ══════════════════════════════════════════════════════════════════════════════
+# EVALUATION — Load Best Checkpoint
+# ══════════════════════════════════════════════════════════════════════════════
 
-ax1.plot(epochs_range, train_losses, 'b-o', label='Train Loss', markersize=4)
-ax1.plot(epochs_range, val_losses,   'r-o', label='Val Loss',   markersize=4)
-ax1.set_title("Loss over Epochs");  ax1.set_xlabel("Epoch");  ax1.set_ylabel("Loss")
-ax1.legend();  ax1.grid(True, alpha=0.3)
-
-ax2.plot(epochs_range, train_accs, 'b-o', label='Train Acc', markersize=4)
-ax2.plot(epochs_range, val_accs,   'r-o', label='Val Acc',   markersize=4)
-ax2.set_title("Accuracy over Epochs");  ax2.set_xlabel("Epoch");  ax2.set_ylabel("Accuracy (%)")
-ax2.legend();  ax2.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.savefig("training_curves.png", dpi=150, bbox_inches='tight')
-plt.close()
-print("Saved: training_curves.png")
-
-# ─────────────────────────────────────────────
-# 7. CONFUSION MATRIX
-# ─────────────────────────────────────────────
-model.load_state_dict(torch.load("best_model.pth", map_location=DEVICE))
+print(f"\n[5/6] Evaluating best checkpoint ({CHECKPOINT})...")
+model.load_state_dict(torch.load(CHECKPOINT, map_location=device))
 model.eval()
 
-all_preds, all_labels = [], []
-with torch.no_grad():
-    for images, labels in val_loader:
-        images = images.to(DEVICE)
-        outputs = model(images)
-        _, predicted = outputs.max(1)
-        all_preds.extend(predicted.cpu().numpy())
-        all_labels.extend(labels.numpy())
-
-cm = confusion_matrix(all_labels, all_preds)
-fig, ax = plt.subplots(figsize=(10, 8))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-            xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax)
-ax.set_title("Confusion Matrix — ASL Digit CNN", fontsize=13, fontweight='bold')
-ax.set_xlabel("Predicted Label");  ax.set_ylabel("True Label")
-plt.tight_layout()
-plt.savefig("confusion_matrix.png", dpi=150, bbox_inches='tight')
-plt.close()
-print("Saved: confusion_matrix.png")
-
-# ─────────────────────────────────────────────
-# 8. CLASSIFICATION REPORT
-# ─────────────────────────────────────────────
-report = classification_report(all_labels, all_preds,
-                                target_names=[f"Digit {c}" for c in CLASS_NAMES])
-print("\nClassification Report:")
-print(report)
-
-with open("classification_report.txt", "w") as f:
-    f.write("ASL Digit CNN — Classification Report\n")
-    f.write("="*45 + "\n\n")
-    f.write(report)
-print("Saved: classification_report.txt")
-
-# ─────────────────────────────────────────────
-# 9. SAMPLE PREDICTIONS VISUALIZATION
-# ─────────────────────────────────────────────
-model.eval()
-images_shown, labels_shown, preds_shown = [], [], []
+all_preds  = []
+all_labels = []
+all_images = []
 
 with torch.no_grad():
-    for images, labels in val_loader:
-        outputs = model(images.to(DEVICE))
-        _, preds = outputs.max(1)
-        images_shown.extend(images[:5])
-        labels_shown.extend(labels[:5].numpy())
-        preds_shown.extend(preds.cpu()[:5].numpy())
-        if len(images_shown) >= 10:
-            break
+    for batch_imgs, batch_labels in val_loader:
+        batch_imgs = batch_imgs.to(device, non_blocking=True)
+        preds = model(batch_imgs).argmax(dim=1).cpu().numpy()
+        all_preds.extend(preds)
+        all_labels.extend(batch_labels.numpy())
+        all_images.append(batch_imgs.cpu())
 
-fig, axes = plt.subplots(2, 5, figsize=(14, 6))
-fig.suptitle("Sample Predictions (Green = Correct, Red = Wrong)", fontsize=12, fontweight='bold')
-mean = np.array([0.5, 0.5, 0.5]);  std = np.array([0.5, 0.5, 0.5])
+all_images = torch.cat(all_images, dim=0)   # [N_val, 3, 64, 64]
 
-for idx, ax in enumerate(axes.flatten()):
-    img = images_shown[idx].numpy().transpose(1, 2, 0)
-    img = np.clip(std * img + mean, 0, 1)
-    ax.imshow(img)
-    true_lbl = CLASS_NAMES[labels_shown[idx]]
-    pred_lbl = CLASS_NAMES[preds_shown[idx]]
-    color = "green" if true_lbl == pred_lbl else "red"
-    ax.set_title(f"True: {true_lbl}\nPred: {pred_lbl}", color=color, fontsize=9)
-    ax.axis('off')
 
-plt.tight_layout()
-plt.savefig("sample_predictions.png", dpi=150, bbox_inches='tight')
-plt.close()
-print("Saved: sample_predictions.png")
+# ══════════════════════════════════════════════════════════════════════════════
+# GENERATE OUTPUT FILES
+# ══════════════════════════════════════════════════════════════════════════════
 
-print("\nAll done! Files created:")
-print("  best_model.pth          — saved model weights")
-print("  training_curves.png     — loss & accuracy plots")
-print("  confusion_matrix.png    — per-class confusion matrix")
-print("  sample_predictions.png  — visual sample predictions")
-print("  classification_report.txt — precision/recall/F1 per class")
+print(f"\n[6/6] Generating evaluation outputs...")
+
+plot_training_curves(train_losses, val_losses, train_accs, val_accs)
+plot_confusion_matrix(all_labels, all_preds, classes)
+plot_sample_predictions(all_images, all_labels, all_preds, classes, n=10)
+save_classification_report(all_labels, all_preds, classes)
+
+print("\n" + "=" * 60)
+print("  All done! Output files:")
+print("    best_model.pth")
+print("    training_curves.png")
+print("    confusion_matrix.png")
+print("    sample_predictions.png")
+print("    classification_report.txt")
+print("=" * 60)
